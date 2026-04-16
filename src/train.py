@@ -1,136 +1,144 @@
 from pathlib import Path
+import torch
+import torch.nn as nn
+import torch.optim as optim
 from speechbrain.inference import EncoderClassifier
 from speechbrain.dataio.dataio import read_audio
-from sklearn.metrics.pairwise import cosine_similarity
-import numpy as np
-import torch
+from torch.utils.data import DataLoader, Dataset
+from speechbrain.augment.time_domain import SpeedPerturb
+import torchaudio.functional as F
 from tqdm import tqdm
+import random
 
+
+# ==================== НАСТРОЙКИ ====================
 DATA_PATH = Path(__file__).parent.parent / 'data' / 'raw' / 'train_part_1' / 'train'
 K = 5
+BATCH_SIZE = 10
+EPOCHS = 5
+LEARNING_RATE = 1e-4
+NUM_FILES_TO_TRAIN = None
 
-
-# ==================== АУГМЕНТАЦИЯ ЧЕРЕЗ TORCHAUDIO ====================
+# ==================== АУГМЕНТАЦИЯ ====================
 class AudioAugmentor:
-    """Аугментация с использованием torchaudio"""
-
-    def __init__(self, noise_level=0.1, reverb=False):
+    def __init__(self, noise_level=0.15):
         self.noise_level = noise_level
-        self.reverb = reverb
 
     def add_noise(self, signal):
-        """Добавляет сильный белый шум"""
         noise = torch.randn_like(signal) * self.noise_level
         return signal + noise
 
-    def add_reverb(self, signal):
-        """Имитация реверберации через свертку"""
-        # Простая имитация: несколько эхо с затуханием
-        reverbed = signal.clone()
-        for delay in [5000, 10000, 15000]:  # задержки в сэмплах
-            if signal.shape[-1] > delay:
-                echo = signal[..., :-delay] * 0.3
-                reverbed[..., delay:delay + echo.shape[-1]] += echo
-        return reverbed
-
-    def perturb_speed(self, signal, sample_rate=16000):
-        """Изменение скорости воспроизведения"""
-        factor = np.random.choice([0.9, 1.0, 1.1])  # -10%, 0%, +10%
-        if factor == 1.0:
-            return signal
-        # Простая реализация через ресемплинг
-        length = int(signal.shape[-1] * factor)
-        if length > signal.shape[-1]:
-            length = signal.shape[-1]
-        indices = torch.linspace(0, signal.shape[-1] - 1, length).long()
-        return signal[..., :length] if length < signal.shape[-1] else signal
-
     def augment(self, signal):
-        """Применяет все аугментации последовательно"""
-        # Сильный шум
-        signal = self.add_noise(signal)
+        return self.add_noise(signal)
 
-        # Реверберация
-        if self.reverb:
-            signal = self.add_reverb(signal)
-
-        # Изменение скорости
-        signal = self.perturb_speed(signal)
-
-        return signal
-
-
-# ==================== 1. ЗАГРУЗКА ДАННЫХ ====================
-print("Загрузка данных...")
+# ==================== 1. ПОДГОТОВКА ДАННЫХ ====================
+print("Загрузка списка файлов...")
 audio_files = list(DATA_PATH.glob('**/*.flac'))
-print(f"Найдено файлов: {len(audio_files)}")
+train_files = audio_files[:NUM_FILES_TO_TRAIN]
 
 file_to_speaker = {}
-for file_path in audio_files:
+speakers_list = []
+for file_path in train_files:
     speaker_id = file_path.parent.name
     file_to_speaker[str(file_path)] = speaker_id
+    if speaker_id not in speakers_list:
+        speakers_list.append(speaker_id)
 
-speakers = list(set(file_to_speaker.values()))
-print(f"Количество дикторов: {len(speakers)}")
+speaker_to_idx = {spk: i for i, spk in enumerate(speakers_list)}
+num_speakers = len(speakers_list)
+print(f"Дикторов: {num_speakers}, Файлов: {len(train_files)}")
 
-# ==================== 2. ЗАГРУЗКА МОДЕЛИ ====================
-print("\nЗагрузка модели...")
-classifier = EncoderClassifier.from_hparams(
+# class AudioDataset(Dataset):
+#     def __init__(self, file_paths, speaker_map, transform=None):
+#         self.file_paths = file_paths
+#         self.speaker_map = speaker_map
+#         self.transform = transform
+#
+#     def __len__(self):
+#         return len(self.file_paths)
+#
+#     def __getitem__(self, idx):
+#         file_path = self.file_paths[idx]
+#         label = self.speaker_map[file_path]
+#         signal = read_audio(str(file_path))
+#         if self.transform:
+#             signal = self.transform(signal)
+#         return signal, label
+#
+# augmentor = AudioAugmentor(noise_level=0.15)
+# dataset = AudioDataset(train_files, file_to_speaker, transform=augmentor.augment)
+# dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+
+# ==================== 2. ЗАГРУЗКА МОДЕЛИ И НАСТРОЙКА ====================
+print("Загрузка модели...")
+
+base_classifier = EncoderClassifier.from_hparams(
     source="speechbrain/spkrec-ecapa-voxceleb",
     savedir="pretrained_models/spkrec-ecapa-voxceleb"
 )
 
-# ==================== 3. АУГМЕНТИРОВАННИЕ И ПОЛУЧЕНИЕ ЭМБЕДДИНГОВ ====================
-# Создаем аугментор с СИЛЬНЫМИ искажениями
-augmentor = AudioAugmentor(noise_level=0.2, reverb=True)
+# Создаем классификатор поверх эмбеддингов
+# Размер эмбеддинга у ECAPA-TDNN обычно 192
+embedding_dim = 192
+output_layer = nn.Linear(embedding_dim, num_speakers)
 
+# Оптимизатор: учим верхний слой
+params_to_optimize = list(output_layer.parameters())
+optimizer = optim.Adam(params_to_optimize, lr=LEARNING_RATE)
+criterion = nn.CrossEntropyLoss()
 
-def get_embeddings(augmentor=None, max_files=500):
-    """Получает эмбеддинги с опциональной аугментацией"""
-    embeddings = []
-    paths = []
+augmentor = AudioAugmentor(noise_level=0.15)
 
-    for file_path in tqdm(audio_files[:max_files], desc="Обработка"):
-        try:
-            signal = read_audio(str(file_path))
+# ==================== 3. ЦИКЛ ОБУЧЕНИЯ ====================
+print(f"\nНачинаем дообучение (Epochs: {EPOCHS})...")
 
-            if augmentor is not None:
-                signal = augmentor.augment(signal)
+for epoch in range(EPOCHS):
+    print(f"\nEpoch {epoch + 1}/{EPOCHS}")
+    random.shuffle(train_files)
 
-            embedding = classifier.encode_batch(signal)
-            embedding = embedding.squeeze().detach().cpu().numpy()
-            embeddings.append(embedding)
-            paths.append(str(file_path))
-        except Exception as e:
-            print(f"Ошибка {file_path}: {e}")
+    for i in tqdm(range(0, len(train_files), BATCH_SIZE), desc="Batch"):
+        batch_files = train_files[i: i + BATCH_SIZE]
+        if len(batch_files) < 2: break
 
-    return np.array(embeddings), paths
+        signals = []
+        labels = []
 
-# Получаем эмбеддинги для аугментированных данных
-print("\nПолучение эмбеддингов аугментированных данных (шум + ревербация)")
-embeddings_aug, paths_aug = get_embeddings(augmentor=augmentor, max_files=5000)
+        for f_path in batch_files:
+            try:
+                sig = read_audio(str(f_path))
+                sig = augmentor.augment(sig)
 
+                if sig.dim() == 1: sig = sig.unsqueeze(0)
+                signals.append(sig)
+                labels.append(speaker_to_idx[file_to_speaker[str(f_path)]])
+            except:
+                continue
 
-def calculate_precision(embeddings, paths, k=5):
-    """Считает Precision@K"""
-    sims = cosine_similarity(embeddings)
-    scores = []
+        if not signals: continue
 
-    for i in range(len(paths)):
-        current_speaker = file_to_speaker[paths[i]]
-        sorted_indices = np.argsort(sims[i])[::-1]
-        top_k_indices = sorted_indices[1:k + 1]
+        # Простой паддинг (обрезаем до мин. длины)
+        min_len = min(s.shape[-1] for s in signals)
+        signals = [s[..., :min_len] for s in signals]
 
-        relevant = sum(1 for idx in top_k_indices
-                       if file_to_speaker[paths[idx]] == current_speaker)
-        scores.append(relevant / k)
+        x = torch.cat(signals, dim=0)
+        y = torch.tensor(labels, dtype=torch.long)
 
-    return np.mean(scores)
+        # Forward pass
+        # Получаем эмбеддинги
+        with torch.no_grad():  # Сначала без градиентов для энкодера (если он есть)
+            embeddings = base_classifier.encode_batch(x)
 
+        embeddings = embeddings.squeeze()
 
-# Считаем метрику
-precision_aug = calculate_precision(embeddings_aug, paths_aug, K)
+        logits = output_layer(embeddings)
+        loss = criterion(logits, y)
 
-print("РЕЗУЛЬТАТЫ:")
-print("=" * 60)
-print(f"Precision@{K}: {precision_aug:.4f}")
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    print(f"Loss: {loss.item():.4f}")
+
+# Сохраняем ТОЛЬКО верхний слой
+torch.save(output_layer.state_dict(), "fine_tuned_head.pt")
+print("\nГолова модели сохранена!")
