@@ -1,144 +1,302 @@
 from pathlib import Path
+import json
+import random
+
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from speechbrain.inference import EncoderClassifier
-from speechbrain.dataio.dataio import read_audio
-from torch.utils.data import DataLoader, Dataset
-from speechbrain.augment.time_domain import SpeedPerturb
-import torchaudio.functional as F
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
-import random
 
+from speechbrain.inference.classifiers import EncoderClassifier
+from speechbrain.dataio.dataio import read_audio
 
-# ==================== НАСТРОЙКИ ====================
-DATA_PATH = Path(__file__).parent.parent / 'data' / 'raw' / 'train_part_1' / 'train'
-K = 5
-BATCH_SIZE = 10
-EPOCHS = 5
-LEARNING_RATE = 1e-4
-NUM_FILES_TO_TRAIN = None
+# ===================== CONFIG =====================
+DATA_PATH = Path(__file__).parent.parent / "data" / "raw" / "train_part_1" / "train"
+OUT_DIR = Path(__file__).parent.parent / "artifacts"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# ==================== АУГМЕНТАЦИЯ ====================
-class AudioAugmentor:
-    def __init__(self, noise_level=0.15):
+SAMPLE_RATE = 16000
+BATCH_SIZE = 16
+EPOCHS = 4
+LR = 1e-3
+WEIGHT_DECAY = 1e-2
+VAL_RATIO = 0.1
+PATIENCE = 2
+NUM_WORKERS = 2
+SEED = 42
+NUM_FILES_TO_TRAIN = 500
+TOP_K = 10
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+# ===================== SEED =====================
+def seed_everything(seed=42):
+    random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = True
+
+seed_everything(SEED)
+
+# ===================== AUGMENTATION =====================
+class SimpleAudioAugmentor:
+    def __init__(self, noise_p=0.6, gain_p=0.5, shift_p=0.5,
+                 noise_level=0.01, gain_min=0.8, gain_max=1.2, max_shift_ratio=0.1):
+        self.noise_p = noise_p
+        self.gain_p = gain_p
+        self.shift_p = shift_p
         self.noise_level = noise_level
+        self.gain_min = gain_min
+        self.gain_max = gain_max
+        self.max_shift_ratio = max_shift_ratio
 
-    def add_noise(self, signal):
-        noise = torch.randn_like(signal) * self.noise_level
-        return signal + noise
+    def add_noise(self, wav):
+        std = wav.std().clamp_min(1e-6)
+        return wav + torch.randn_like(wav) * std * self.noise_level
 
-    def augment(self, signal):
-        return self.add_noise(signal)
+    def apply_gain(self, wav):
+        gain = random.uniform(self.gain_min, self.gain_max)
+        return wav * gain
 
-# ==================== 1. ПОДГОТОВКА ДАННЫХ ====================
-print("Загрузка списка файлов...")
-audio_files = list(DATA_PATH.glob('**/*.flac'))
-train_files = audio_files[:NUM_FILES_TO_TRAIN]
+    def time_shift(self, wav):
+        if wav.numel() < 2:
+            return wav
+        max_shift = max(1, int(wav.shape[-1] * self.max_shift_ratio))
+        shift = random.randint(-max_shift, max_shift)
+        return torch.roll(wav, shifts=shift, dims=-1)
 
-file_to_speaker = {}
-speakers_list = []
-for file_path in train_files:
-    speaker_id = file_path.parent.name
-    file_to_speaker[str(file_path)] = speaker_id
-    if speaker_id not in speakers_list:
-        speakers_list.append(speaker_id)
+    def __call__(self, wav):
+        if random.random() < self.noise_p:
+            wav = self.add_noise(wav)
+        if random.random() < self.gain_p:
+            wav = self.apply_gain(wav)
+        if random.random() < self.shift_p:
+            wav = self.time_shift(wav)
+        return wav
 
-speaker_to_idx = {spk: i for i, spk in enumerate(speakers_list)}
-num_speakers = len(speakers_list)
-print(f"Дикторов: {num_speakers}, Файлов: {len(train_files)}")
+augmentor = SimpleAudioAugmentor()
 
-# class AudioDataset(Dataset):
-#     def __init__(self, file_paths, speaker_map, transform=None):
-#         self.file_paths = file_paths
-#         self.speaker_map = speaker_map
-#         self.transform = transform
-#
-#     def __len__(self):
-#         return len(self.file_paths)
-#
-#     def __getitem__(self, idx):
-#         file_path = self.file_paths[idx]
-#         label = self.speaker_map[file_path]
-#         signal = read_audio(str(file_path))
-#         if self.transform:
-#             signal = self.transform(signal)
-#         return signal, label
-#
-# augmentor = AudioAugmentor(noise_level=0.15)
-# dataset = AudioDataset(train_files, file_to_speaker, transform=augmentor.augment)
-# dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+# ===================== DATASET =====================
+class SpeakerDataset(Dataset):
+    def __init__(self, file_paths, speaker_to_idx, train=True):
+        self.file_paths = list(file_paths)
+        self.speaker_to_idx = speaker_to_idx
+        self.train = train
 
-# ==================== 2. ЗАГРУЗКА МОДЕЛИ И НАСТРОЙКА ====================
-print("Загрузка модели...")
+    def __len__(self):
+        return len(self.file_paths)
 
-base_classifier = EncoderClassifier.from_hparams(
-    source="speechbrain/spkrec-ecapa-voxceleb",
-    savedir="pretrained_models/spkrec-ecapa-voxceleb"
-)
+    def __getitem__(self, idx):
+        path = self.file_paths[idx]
+        wav = read_audio(str(path))
 
-# Создаем классификатор поверх эмбеддингов
-# Размер эмбеддинга у ECAPA-TDNN обычно 192
-embedding_dim = 192
-output_layer = nn.Linear(embedding_dim, num_speakers)
+        if wav.dim() == 2:
+            wav = wav.mean(dim=0)
+        elif wav.dim() > 2:
+            wav = wav.squeeze()
 
-# Оптимизатор: учим верхний слой
-params_to_optimize = list(output_layer.parameters())
-optimizer = optim.Adam(params_to_optimize, lr=LEARNING_RATE)
-criterion = nn.CrossEntropyLoss()
+        wav = wav.float()
 
-augmentor = AudioAugmentor(noise_level=0.15)
+        if self.train:
+            wav = augmentor(wav)
 
-# ==================== 3. ЦИКЛ ОБУЧЕНИЯ ====================
-print(f"\nНачинаем дообучение (Epochs: {EPOCHS})...")
+        label = self.speaker_to_idx[path.parent.name]
+        return wav, label, str(path)
 
-for epoch in range(EPOCHS):
-    print(f"\nEpoch {epoch + 1}/{EPOCHS}")
-    random.shuffle(train_files)
+def collate_fn(batch):
+    wavs, labels, paths = zip(*batch)
+    lengths = torch.tensor([w.shape[-1] for w in wavs], dtype=torch.float32)
+    max_len = int(lengths.max().item())
 
-    for i in tqdm(range(0, len(train_files), BATCH_SIZE), desc="Batch"):
-        batch_files = train_files[i: i + BATCH_SIZE]
-        if len(batch_files) < 2: break
+    padded = []
+    for w in wavs:
+        if w.shape[-1] < max_len:
+            w = torch.nn.functional.pad(w, (0, max_len - w.shape[-1]))
+        padded.append(w)
 
-        signals = []
-        labels = []
+    wavs = torch.stack(padded, dim=0)
+    wav_lens = lengths / max_len
+    labels = torch.tensor(labels, dtype=torch.long)
+    return wavs, wav_lens, labels, paths
 
-        for f_path in batch_files:
-            try:
-                sig = read_audio(str(f_path))
-                sig = augmentor.augment(sig)
+# ===================== METRICS =====================
+@torch.no_grad()
+def batch_accuracy(logits, targets):
+    return (logits.argmax(dim=-1) == targets).float().mean().item()
 
-                if sig.dim() == 1: sig = sig.unsqueeze(0)
-                signals.append(sig)
-                labels.append(speaker_to_idx[file_to_speaker[str(f_path)]])
-            except:
-                continue
+@torch.no_grad()
+def evaluate(encoder, head, loader, criterion):
+    encoder.eval()
+    head.eval()
+    total_loss = 0.0
+    total_acc = 0.0
+    total_n = 0
 
-        if not signals: continue
+    for wavs, wav_lens, labels, _ in tqdm(loader, desc="val", leave=False):
+        wavs = wavs.to(DEVICE, non_blocking=True)
+        wav_lens = wav_lens.to(DEVICE, non_blocking=True)
+        labels = labels.to(DEVICE, non_blocking=True)
 
-        # Простой паддинг (обрезаем до мин. длины)
-        min_len = min(s.shape[-1] for s in signals)
-        signals = [s[..., :min_len] for s in signals]
+        emb = encoder.encode_batch(wavs, wav_lens=wav_lens)
+        if emb.dim() == 3:
+            emb = emb.squeeze(1)
 
-        x = torch.cat(signals, dim=0)
-        y = torch.tensor(labels, dtype=torch.long)
+        logits = head(emb)
+        loss = criterion(logits, labels)
 
-        # Forward pass
-        # Получаем эмбеддинги
-        with torch.no_grad():  # Сначала без градиентов для энкодера (если он есть)
-            embeddings = base_classifier.encode_batch(x)
+        bs = labels.size(0)
+        total_loss += loss.item() * bs
+        total_acc += batch_accuracy(logits, labels) * bs
+        total_n += bs
 
-        embeddings = embeddings.squeeze()
+    return total_loss / max(1, total_n), total_acc / max(1, total_n)
 
-        logits = output_layer(embeddings)
-        loss = criterion(logits, y)
+# ===================== MAIN =====================
+def main():
+    audio_files = sorted(DATA_PATH.glob("**/*.flac"))
+    if NUM_FILES_TO_TRAIN is not None:
+        audio_files = audio_files[:NUM_FILES_TO_TRAIN]
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+    speakers = sorted({p.parent.name for p in audio_files})
+    speaker_to_idx = {spk: i for i, spk in enumerate(speakers)}
+    num_speakers = len(speakers)
 
-    print(f"Loss: {loss.item():.4f}")
+    print(f"Files: {len(audio_files)}, Speakers: {num_speakers}")
 
-# Сохраняем ТОЛЬКО верхний слой
-torch.save(output_layer.state_dict(), "fine_tuned_head.pt")
-print("\nГолова модели сохранена!")
+    idxs = list(range(len(audio_files)))
+    random.shuffle(idxs)
+    val_size = max(1, int(len(idxs) * VAL_RATIO))
+    val_idxs = idxs[:val_size]
+    train_idxs = idxs[val_size:]
+
+    train_files = [audio_files[i] for i in train_idxs]
+    val_files = [audio_files[i] for i in val_idxs]
+
+    train_ds = SpeakerDataset(train_files, speaker_to_idx, train=True)
+    val_ds = SpeakerDataset(val_files, speaker_to_idx, train=False)
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=NUM_WORKERS > 0
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=NUM_WORKERS > 0
+    )
+
+    print("Loading pretrained encoder...")
+    encoder = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir="pretrained_models/spkrec-ecapa-voxceleb"
+    ).to(DEVICE)
+    encoder.eval()
+
+    with torch.no_grad():
+        dummy = torch.randn(2, SAMPLE_RATE, device=DEVICE)
+        dummy_emb = encoder.encode_batch(dummy)
+        if dummy_emb.dim() == 3:
+            dummy_emb = dummy_emb.squeeze(1)
+        emb_dim = dummy_emb.shape[-1]
+
+    head = nn.Linear(emb_dim, num_speakers).to(DEVICE)
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.05)
+    optimizer = optim.AdamW(head.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=1)
+
+    best_val_loss = float("inf")
+    bad_epochs = 0
+    best_path = OUT_DIR / "best_checkpoint.pt"
+    history = []
+
+    for epoch in range(1, EPOCHS + 1):
+        encoder.eval()
+        head.train()
+
+        tr_loss = 0.0
+        tr_acc = 0.0
+        n = 0
+
+        pbar = tqdm(train_loader, desc=f"epoch {epoch}/{EPOCHS}")
+        for wavs, wav_lens, labels, _ in pbar:
+            wavs = wavs.to(DEVICE, non_blocking=True)
+            wav_lens = wav_lens.to(DEVICE, non_blocking=True)
+            labels = labels.to(DEVICE, non_blocking=True)
+
+            with torch.no_grad():
+                emb = encoder.encode_batch(wavs, wav_lens=wav_lens)
+                if emb.dim() == 3:
+                    emb = emb.squeeze(1)
+
+            logits = head(emb)
+            loss = criterion(logits, labels)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(head.parameters(), 1.0)
+            optimizer.step()
+
+            bs = labels.size(0)
+            tr_loss += loss.item() * bs
+            tr_acc += batch_accuracy(logits, labels) * bs
+            n += bs
+            pbar.set_postfix(loss=loss.item())
+
+        tr_loss /= max(1, n)
+        tr_acc /= max(1, n)
+
+        val_loss, val_acc = evaluate(encoder, head, val_loader, criterion)
+        scheduler.step(val_loss)
+
+        history.append({
+            "epoch": epoch,
+            "train_loss": tr_loss,
+            "train_acc": tr_acc,
+            "val_loss": val_loss,
+            "val_acc": val_acc,
+            "lr": optimizer.param_groups[0]["lr"]
+        })
+
+        print(f"epoch={epoch} train_loss={tr_loss:.4f} train_acc={tr_acc:.4f} val_loss={val_loss:.4f} val_acc={val_acc:.4f}")
+
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            bad_epochs = 0
+            torch.save({
+                "head_state_dict": head.state_dict(),
+                "speaker_to_idx": speaker_to_idx,
+                "idx_to_speaker": {v: k for k, v in speaker_to_idx.items()},
+                "emb_dim": emb_dim,
+                "sample_rate": SAMPLE_RATE,
+                "top_k": TOP_K,
+                "config": {
+                    "batch_size": BATCH_SIZE,
+                    "epochs": EPOCHS,
+                    "lr": LR,
+                    "weight_decay": WEIGHT_DECAY,
+                    "val_ratio": VAL_RATIO,
+                    "seed": SEED
+                }
+            }, best_path)
+            print(f"saved: {best_path}")
+        else:
+            bad_epochs += 1
+            if bad_epochs >= PATIENCE:
+                print("early stopping")
+                break
+
+    with open(OUT_DIR / "train_history.json", "w", encoding="utf-8") as f:
+        json.dump(history, f, ensure_ascii=False, indent=2)
+
+if __name__ == "__main__":
+    main()

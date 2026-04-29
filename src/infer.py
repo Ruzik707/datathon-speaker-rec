@@ -1,101 +1,235 @@
-import pandas as pd
-import numpy as np
 from pathlib import Path
-from speechbrain.inference import EncoderClassifier
-from speechbrain.dataio.dataio import read_audio
-from sklearn.metrics.pairwise import cosine_similarity
+import os
+import warnings
+
+import numpy as np
+import pandas as pd
+import torch
+from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# ==================== НАСТРОЙКИ ====================
-TEST_PATH = Path(__file__).parent.parent / 'data' / 'test' / 'test_public'
-K = 5
+import faiss
+from speechbrain.inference.classifiers import EncoderClassifier
+from speechbrain.dataio.dataio import read_audio
 
-# ==================== 1. ЗАГРУЗКА МОДЕЛИ ====================
-print("Загрузка модели для инференса...")
-classifier = EncoderClassifier.from_hparams(
-    source="speechbrain/spkrec-ecapa-voxceleb",
-    savedir="pretrained_models/spkrec-ecapa-voxceleb"
-)
-# Переводим в режим оценки (выключаем dropout и т.д.)
-classifier.eval()
-print("Модель готова!")
+warnings.filterwarnings("ignore")
 
-# ==================== 2. ЗАГРУЗКА ТЕСТОВЫХ ФАЙЛОВ ====================
-print("Поиск тестовых файлов...")
-test_files = list(TEST_PATH.glob('**/*.flac'))
+# ===================== CONFIG =====================
+ROOT = Path(__file__).resolve().parent.parent
+DATA_ROOT = ROOT / "data" / "test"
+TEST_CSV = ROOT / "data" / "test_public.csv"
+CHECKPOINT_PATH = ROOT / "artifacts" / "best_checkpoint.pt"
+OUTPUT_PATH = ROOT / "submission.csv"
 
-print(f"Найдено {len(test_files)} файлов для проверки.")
+BATCH_SIZE = 16
+NUM_WORKERS = 0  # for debugging set 0, for faster inference try 2
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+TOP_K = 10
 
-# ==================== 3. ПОЛУЧЕНИЕ ЭМБЕДДИНГОВ ====================
-print("Извлечение эмбеддингов...")
-embeddings = []
+# ===================== PATHS =====================
+def resolve_audio_path(filepath: str) -> Path:
+    p = Path(str(filepath))
 
-for file_path in tqdm(test_files):
-    try:
-        # 1. Читаем аудио
-        signal = read_audio(str(file_path))
+    candidates = []
 
-        # 2. Получаем вектор (эмбеддинг)
-        # .detach().cpu().numpy() переводит тензор в обычный массив numpy
-        embedding = classifier.encode_batch(signal)
-        embedding = embedding.squeeze().detach().cpu().numpy()
+    # 1) as-is relative to DATA_ROOT
+    candidates.append(DATA_ROOT / p)
 
-        embeddings.append(embedding)
-    except Exception as e:
-        print(f"Ошибка при обработке {file_path}: {e}")
+    # 2) if path starts with test_public / test_private, strip first part
+    if len(p.parts) > 1 and p.parts[0] in {"test_public", "test_private"}:
+        candidates.append(DATA_ROOT / Path(*p.parts[1:]))
 
-# Превращаем список векторов в матрицу [N_files, 192]
-embeddings = np.array(embeddings)
-print(f"Успешно обработано {len(embeddings)} файлов.")
+    # 3) fallback by filename only
+    candidates.append(DATA_ROOT / p.name)
+    candidates.append(ROOT / p)
+    candidates.append(ROOT / p.name)
 
-# ==================== 4. ПОИСК СОСЕДЕЙ (KNN) ====================
-print("Поиск ближайших соседей...")
+    seen = set()
+    unique_candidates = []
+    for c in candidates:
+        c = c.resolve() if c.exists() else c
+        if str(c) not in seen:
+            seen.add(str(c))
+            unique_candidates.append(c)
 
-# Считаем матрицу косинусного сходства (каждый с каждым)
-# Результат: матрица размером [N, N], где sims[i][j] - похожеть файла i и j
-sims = cosine_similarity(embeddings)
+    for c in unique_candidates:
+        if c.exists():
+            return c
 
-results = []
+    raise FileNotFoundError(
+        f"Audio file not found for filepath='{filepath}'. Tried: "
+        + " | ".join(str(c) for c in unique_candidates)
+    )
 
-# Для каждого файла находим топ-K соседей
-for i in tqdm(range(len(test_files))):
-    # Получаем строку сходств для текущего файла i
-    current_file_path = test_files[i]
-    relative_path = "test_public/" + str(current_file_path.relative_to(TEST_PATH))
+# ===================== DATASET =====================
+class TestAudioDataset(Dataset):
+    def __init__(self, filepaths):
+        self.filepaths = list(filepaths)
 
-    # Сортируем индексы по убыванию сходства (от самого похожего)
-    # argsort возвращает индексы от меньшего к большему, [::-1] разворачивает
-    sorted_indices = np.argsort(sims[i])[::-1]
+    def __len__(self):
+        return len(self.filepaths)
 
-    # Берем первые K+1 индексов (так как 0-й индекс - это сам файл)
-    # Нам нужны соседи, исключаем самого себя (индекс i)
-    # Но sorted_indices[0] может быть не i, если есть файлы идентичные.
-    # Безопасный способ: отфильтровать свой индекс
+    def __getitem__(self, idx):
+        rel_path = self.filepaths[idx]
+        full_path = resolve_audio_path(rel_path)
+        wav = read_audio(str(full_path))
 
-    neighbors = []
-    count = 0
-    for idx in sorted_indices:
-        if idx == i:
-            continue  # Пропускаем сам файл
-        neighbors.append(idx)
-        count += 1
-        if count == K:
-            break
+        if wav.dim() == 2:
+            wav = wav.mean(dim=0)
+        elif wav.dim() > 2:
+            wav = wav.squeeze()
 
-    # Формируем строку для CSV: "5, 12, 88, 2, 10"
-    neighbors_str = ",".join(map(str, neighbors))
+        wav = wav.float()
+        return wav, str(rel_path), str(full_path)
 
-    results.append([relative_path, neighbors_str])
+def collate_fn(batch):
+    wavs, rel_paths, full_paths = zip(*batch)
+    lengths = torch.tensor([w.shape[-1] for w in wavs], dtype=torch.float32)
+    max_len = int(lengths.max().item())
 
-# ==================== 5. СОХРАНЕНИЕ SUBMISSION ====================
-print("Сохранение submission.csv...")
+    padded = []
+    for w in wavs:
+        if w.shape[-1] < max_len:
+            w = torch.nn.functional.pad(w, (0, max_len - w.shape[-1]))
+        padded.append(w)
 
-# Создаем DataFrame
-df = pd.DataFrame(results, columns=['filepath', 'neighbours'])
+    wavs = torch.stack(padded, dim=0)
+    wav_lens = lengths / max_len
+    return wavs, wav_lens, list(rel_paths), list(full_paths)
 
-# Сохраняем
-df.to_csv('submission.csv', index=False)
+# ===================== EMBEDDINGS =====================
+@torch.no_grad()
+def embed_files(encoder, loader):
+    encoder.eval()
+    all_embs = []
+    all_paths = []
 
-print("Готово! Файл submission.csv создан.")
-print("Пример первых строк:")
-print(df.head())
+    for wavs, wav_lens, rel_paths, _ in tqdm(loader, desc="Embedding"):
+        wavs = wavs.to(DEVICE, non_blocking=True)
+        wav_lens = wav_lens.to(DEVICE, non_blocking=True)
+
+        emb = encoder.encode_batch(wavs, wav_lens=wav_lens)
+        if emb.dim() == 3:
+            emb = emb.squeeze(1)
+
+        emb = torch.nn.functional.normalize(emb, p=2, dim=-1)
+
+        all_embs.append(emb.cpu())
+        all_paths.extend(rel_paths)
+
+    all_embs = torch.cat(all_embs, dim=0)
+    return all_embs, all_paths
+
+# ===================== SUBMISSION =====================
+def load_test_list(test_csv_path: Path):
+    df = pd.read_csv(test_csv_path)
+
+    if "filepath" in df.columns:
+        paths = df["filepath"].astype(str).tolist()
+        col_name = "filepath"
+    elif "Filepath" in df.columns:
+        paths = df["Filepath"].astype(str).tolist()
+        col_name = "Filepath"
+    else:
+        raise ValueError("test.csv must contain 'filepath' or 'Filepath' column")
+
+    return df, paths, col_name
+
+def build_submission(test_df, filepaths, neighbor_indices, out_path: Path):
+    rows = []
+    for path, neigh in zip(filepaths, neighbor_indices):
+        neigh = [int(x) for x in neigh]
+        neigh = list(dict.fromkeys(neigh))
+        neigh_str = ",".join(map(str, neigh))
+        rows.append({"Filepath": path, "Neighbours": neigh_str})
+
+    sub = pd.DataFrame(rows)
+
+    # preserve original order if test_df had filepath column
+    if "filepath" in test_df.columns:
+        sub["Filepath"] = test_df["filepath"].astype(str).tolist()
+    elif "Filepath" in test_df.columns:
+        sub["Filepath"] = test_df["Filepath"].astype(str).tolist()
+
+    sub.to_csv(out_path, index=False, encoding="utf-8")
+
+# ===================== MAIN =====================
+def main():
+    print("Loading test list...")
+    test_df, test_paths, _ = load_test_list(TEST_CSV)
+
+    print(f"Test items: {len(test_paths)}")
+    for i, p in enumerate(test_paths[:3]):
+        print(f"Sample path[{i}]: {p}")
+
+    dataset = TestAudioDataset(test_paths)
+    loader = DataLoader(
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn,
+        pin_memory=torch.cuda.is_available(),
+        persistent_workers=(NUM_WORKERS > 0)
+    )
+
+    print("Loading checkpoint...")
+    ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu")
+    emb_dim = ckpt.get("emb_dim", None)
+    top_k_train = ckpt.get("top_k", TOP_K)
+    if top_k_train != TOP_K:
+        print(f"Warning: checkpoint top_k={top_k_train}, inference TOP_K={TOP_K}")
+
+    print("Loading pretrained encoder...")
+    encoder = EncoderClassifier.from_hparams(
+        source="speechbrain/spkrec-ecapa-voxceleb",
+        savedir=str(ROOT / "pretrained_models" / "spkrec-ecapa-voxceleb")
+    ).to(DEVICE)
+    encoder.eval()
+
+    print("Building embeddings...")
+    embeddings, rel_paths = embed_files(encoder, loader)
+    embeddings_np = embeddings.numpy().astype(np.float32)
+
+    if embeddings_np.shape[0] != len(rel_paths):
+        raise RuntimeError("Embeddings count does not match paths count")
+
+    print("Building FAISS index...")
+    faiss.normalize_L2(embeddings_np)
+    index = faiss.IndexFlatIP(embeddings_np.shape[1])
+    index.add(embeddings_np)
+
+    k_search = TOP_K + 1
+    scores, neighbors = index.search(embeddings_np, k_search)
+
+    print("Filtering self-match and duplicates...")
+    final_neighbors = []
+    for i, row in enumerate(neighbors):
+        filtered = []
+        seen = {i}
+        for j in row:
+            j = int(j)
+            if j in seen:
+                continue
+            seen.add(j)
+            filtered.append(j)
+            if len(filtered) == TOP_K:
+                break
+
+        if len(filtered) < TOP_K:
+            all_ids = list(range(len(rel_paths)))
+            for j in all_ids:
+                if j not in seen:
+                    filtered.append(j)
+                    seen.add(j)
+                if len(filtered) == TOP_K:
+                    break
+
+        final_neighbors.append(filtered[:TOP_K])
+
+    print("Saving submission...")
+    build_submission(test_df, rel_paths, final_neighbors, OUTPUT_PATH)
+    print(f"Done. Saved submission to: {OUTPUT_PATH}")
+
+if __name__ == "__main__":
+    main()
