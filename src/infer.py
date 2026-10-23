@@ -18,7 +18,6 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent.parent
 DATA_ROOT = ROOT / "data" / "test"
 TEST_CSV = ROOT / "data" / "test_public.csv"
-CHECKPOINT_PATH = ROOT / "artifacts" / "best_checkpoint.pt"
 OUTPUT_PATH = ROOT / "submission.csv"
 
 BATCH_SIZE = 16
@@ -172,13 +171,6 @@ def main():
         pin_memory=torch.cuda.is_available(),
         persistent_workers=(NUM_WORKERS > 0)
     )
-
-    print("Loading checkpoint...")
-    ckpt = torch.load(CHECKPOINT_PATH, map_location="cpu")
-    emb_dim = ckpt.get("emb_dim", None)
-    top_k_train = ckpt.get("top_k", TOP_K)
-    if top_k_train != TOP_K:
-        print(f"Warning: checkpoint top_k={top_k_train}, inference TOP_K={TOP_K}")
 
     print("Loading pretrained encoder...")
     encoder = EncoderClassifier.from_hparams(

@@ -17,7 +17,6 @@ warnings.filterwarnings("ignore")
 ROOT = Path(__file__).resolve().parent
 DATA_ROOT = ROOT / "test_public"
 TEST_CSV = ROOT / "test_public.csv"
-CHECKPOINT_PATH = ROOT / "artifacts" / "best_head.pt"
 OUTPUT_PATH = ROOT / "submission.csv"
 
 SAMPLE_RATE = 16000
@@ -210,8 +209,6 @@ def main():
         pin_memory=torch.cuda.is_available(),
         persistent_workers=NUM_WORKERS > 0
     )
-
-    _ = torch.load(CHECKPOINT_PATH, map_location="cpu")
 
     encoder = EncoderClassifier.from_hparams(
         source="speechbrain/spkrec-ecapa-voxceleb",

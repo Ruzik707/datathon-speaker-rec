@@ -21,3 +21,10 @@ Thumbs.db
 
 # Директории с данными (если не хотим хранить в гите)
 data/
+
+# Downloaded encoders and generated multi-view outputs
+pretrained_models/
+src/pretrained_models/
+src_gpu/pretrained_models/
+src_gpu/artifacts/
+src_gpu/submission.csv
